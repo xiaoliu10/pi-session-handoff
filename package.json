@@ -1,0 +1,46 @@
+{
+  "name": "@wengine-ai/pi-session-handoff",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Hand a self-contained task to another local pi session (GUI or TUI) — recipient keeps its own project, model and permissions; busy targets queue instead of being interrupted.",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension",
+    "session",
+    "handoff",
+    "agent"
+  ],
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "index.mjs",
+    "transport.mjs",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.mjs"
+    ]
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "pack:check": "npm pack --dry-run"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiaoliu10/pi-session-handoff.git"
+  },
+  "homepage": "https://github.com/xiaoliu10/pi-session-handoff",
+  "bugs": {
+    "url": "https://github.com/xiaoliu10/pi-session-handoff/issues"
+  }
+}
