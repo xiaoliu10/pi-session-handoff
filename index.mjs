@@ -5,6 +5,19 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as transport from './transport.mjs';
 
 const MAX_QUEUED = 32;
+/**
+ * UI 应答超时保护。Desktop 保留通道（desktop-handoff）的应答方是主进程，
+ * 纯 TUI/rpc 会话里没有人应答：只读查询必须快速降级，写操作必须明确失败，
+ * 否则工具调用会一直挂着，模型侧表现为「卡住不动」。
+ */
+const withTimeout = (promise, ms) => new Promise((resolve) => {
+  let settled = false;
+  const timer = setTimeout(() => { if (!settled) { settled = true; resolve(undefined); } }, ms);
+  if (typeof timer?.unref === 'function') timer.unref();
+  Promise.resolve(promise).then(v => { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } },
+    () => { if (!settled) { settled = true; clearTimeout(timer); resolve(undefined); } });
+});
+
 const canonical = file => {
   // The session file may not exist yet (idle session, pi flushes lazily). realpathSync
   // throws ENOENT on it, which would silently abort peer startup; resolve the parent
@@ -169,7 +182,9 @@ export default function sessionHandoff(pi, options = {}) {
         if (args.action === 'list') {
           let sessions = candidates.map(s => ({...s, key: s.sessionKey ?? s.key, connected: true}));
           if (env.PI_DESKTOP_HANDOFF_BRIDGE === '1' && projectPath) {
-            const raw = await ctx.ui.input('desktop-handoff', JSON.stringify({v: 1, action: 'list', projectPath}));
+            // list 是只读查询：Desktop 应答方不在（纯 TUI/rpc 场景、未连接 Desktop）时
+            // 必须降级返回本地候选，绝不能挂起整个工具调用。用短超时兜底。
+            const raw = await withTimeout(ctx.ui.input('desktop-handoff', JSON.stringify({v: 1, action: 'list', projectPath})), 1500);
             if (raw !== undefined) {
               const extra = JSON.parse(raw);
               if (!extra.ok) throw new Error(extra.error || 'Desktop 候选查询失败');
@@ -203,8 +218,10 @@ export default function sessionHandoff(pi, options = {}) {
             if (!peer) throw new Error('当前会话尚未持久化，请先发送一条消息后再交接');
             result = await peer.send({sessionKey: target.sessionKey ?? target.key, message: args.message, source: metadata(ctx), idempotencyKey, signal});
           } else if (env.PI_DESKTOP_HANDOFF_BRIDGE === '1' && projectPath) {
-            const raw = await ctx.ui.input('desktop-handoff', JSON.stringify({v: 1, ...args, projectPath, idempotencyKey}));
-            if (raw === undefined) throw new Error('交接已取消');
+            // send 是写操作，必须等应答方（排队语义由 Desktop 侧保证），但也不能无限挂——
+            // 超时后明确失败，让模型能看到原因而不是干等。
+            const raw = await withTimeout(ctx.ui.input('desktop-handoff', JSON.stringify({v: 1, ...args, projectPath, idempotencyKey})), 30000);
+            if (raw === undefined) throw new Error('交接超时：Desktop 侧未应答（目标未连接或已断开）');
             result = JSON.parse(raw);
           } else throw new Error('目标会话未在线、未加载插件或与项目不匹配；请先 list');
         } else throw new Error('action 必须为 list 或 send');
