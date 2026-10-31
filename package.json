@@ -1,6 +1,6 @@
 {
   "name": "@wengine-ai/pi-session-handoff",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "type": "module",
   "description": "Hand a self-contained task to another local pi session (GUI or TUI) — recipient keeps its own project, model and permissions; busy targets queue instead of being interrupted.",
   "keywords": [

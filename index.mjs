@@ -62,7 +62,15 @@ export default function sessionHandoff(pi, options = {}) {
   const queue = [];
   const receipts = new Map();
 
-  const metadata = ctx => {
+  /**
+ * 侧车/子代理会话（Desktop 副驾、pi-subagents worker，header 带 parentSession
+ * 或 PI_DESKTOP_SIDECAR=1）按单写者设计被排除在交接之外：不建 peer、不作为候选。
+ * 此前工具仍被无条件激活，侧车模型看得到并调用它，然后 send 分支撞上误导性的
+ * 「尚未持久化」无限重试（2026-10-30 用户实测：VE 子代理反复报错）。
+ */
+const isSidecar = ctx => !!ctx?.sessionManager?.getHeader?.()?.parentSession || env.PI_DESKTOP_SIDECAR === '1';
+
+const metadata = ctx => {
     const file = ctx.sessionManager.getSessionFile();
     if (!file) return undefined;
     // pi may not have flushed the transcript yet, so the file can be absent while an
@@ -125,11 +133,15 @@ export default function sessionHandoff(pi, options = {}) {
     alive = true;
     // Extension tools are not activated by defaultTools/--tools, so a portable install
     // would register session_handoff but never declare it to the model. Activate it here,
-    // the same way desktop-policy activates desktop_update_plan.
-    try {
-      const active = pi.getActiveTools?.() ?? [];
-      if (!active.includes('session_handoff')) pi.setActiveTools?.([...active, 'session_handoff']);
-    } catch { /* activation is best-effort; the tool still works when called explicitly */ }
+    // the same way desktop-policy activates desktop_update_plan. Sidecar sessions are
+    // excluded from handoff entirely — advertising the tool to them only invites
+    // call → misleading failure → endless retry.
+    if (!isSidecar(ctx)) {
+      try {
+        const active = pi.getActiveTools?.() ?? [];
+        if (!active.includes('session_handoff')) pi.setActiveTools?.([...active, 'session_handoff']);
+      } catch { /* activation is best-effort; the tool still works when called explicitly */ }
+    }
     await start(ctx);
   });
   pi.on('before_agent_start', async (event, ctx) => {markReceipt(event); await start(ctx);});
@@ -172,6 +184,9 @@ export default function sessionHandoff(pi, options = {}) {
     async execute(_id, args, signal, _update, ctx) {
       try {
         signal?.throwIfAborted();
+        if (isSidecar(ctx)) {
+          return {isError: true, content: [{type: 'text', text: '会话交接失败：当前会话是子代理（sidecar）会话，按单写者设计不能发起交接；请在主会话中使用 session_handoff'}], details: {ok: false, error: 'sidecar-not-allowed'}};
+        }
         await start(ctx);
         const projectPath = args.projectPath ? canonical(args.projectPath) : undefined;
         if (args.projectPath && !path.isAbsolute(args.projectPath)) throw new Error('projectPath 必须是绝对路径');
@@ -215,7 +230,7 @@ export default function sessionHandoff(pi, options = {}) {
           else if (candidates.length > 1) throw new Error('多个在线候选，请先 list 并指定 sessionKey');
           const idempotencyKey = args.idempotencyKey || randomUUID();
           if (target) {
-            if (!peer) throw new Error('当前会话尚未持久化，请先发送一条消息后再交接');
+            if (!peer) throw new Error('当前会话尚未建立交接通道（会话刚创建尚未持久化，或 Desktop 桥未连接）；请先发送一条消息后再交接');
             result = await peer.send({sessionKey: target.sessionKey ?? target.key, message: args.message, source: metadata(ctx), idempotencyKey, signal});
           } else if (env.PI_DESKTOP_HANDOFF_BRIDGE === '1' && projectPath) {
             // send 是写操作，必须等应答方（排队语义由 Desktop 侧保证），但也不能无限挂——
