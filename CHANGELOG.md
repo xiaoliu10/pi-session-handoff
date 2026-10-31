@@ -2,34 +2,6 @@
 
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-## [0.1.2] - 2026-10-30
-
-### English
-
-#### Fixed
-
-- **Sidecar/subagent sessions no longer see (or misfire) the handoff tool**: sessions with a `parentSession` header (Desktop 副驾, pi-subagents workers) are excluded from handoff by the single-writer design, but the tool was still advertised to them. A sidecar model could call `session_handoff`, discover targets via the registry, then hit a misleading "当前会话尚未持久化" error and retry endlessly (observed live 2026-10-30 in a VE subagent). Now sidecars never get the tool activated, and an explicit call fails fast with `sidecar-not-allowed` and a clear message.
-
-### 中文
-
-#### 修复
-
-- **侧车/子代理会话不再看到（或误用）交接工具**：带 `parentSession` header 的会话（Desktop 副驾、pi-subagents worker）按单写者设计被排除在交接之外，但工具此前仍被无条件激活。侧车模型调用 `session_handoff` 后能经 registry 发现目标，然后在 send 分支撞上误导性的「当前会话尚未持久化」并无限重试（2026-10-30 VE 子代理实测）。现在侧车不再激活该工具；被显式调用时 fail-fast 返回 `sidecar-not-allowed` 与明确说明。
-
-## [0.1.1] - 2026-10-30
-
-### English
-
-#### Fixed
-
-- **`action: "list"` no longer hangs when nothing answers the Desktop bridge**: list is a read-only query, but it awaited the `desktop-handoff` UI response with no timeout. In a plain TUI/rpc session there is no responder, so the tool call never returned and the model looked frozen. It now falls back after 1.5 s to the locally discovered candidates. `send` (a write) keeps waiting but fails explicitly after 30 s with "Desktop 侧未应答" instead of hanging forever.
-
-### 中文
-
-#### 修复
-
-- **`action: "list"` 在无人应答 Desktop 桥时不再挂起**：list 是只读查询，此前却无限等待 `desktop-handoff` 的 UI 应答。纯 TUI/rpc 会话没有应答方，工具调用永不返回，模型侧表现为「卡住不动」。现在 1.5 秒后降级返回本地已发现的候选。`send`（写操作）仍会等待，但 30 秒后明确报「Desktop 侧未应答」，不再无限期挂起。
-
 
 ## [0.1.0] - 2026-10-29
 
