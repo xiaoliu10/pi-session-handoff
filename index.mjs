@@ -53,6 +53,8 @@ function envelope(message, source = {}, receipt) {
 export default function sessionHandoff(pi, options = {}) {
   const wire = options.transport ?? transport;
   const env = options.env ?? process.env;
+  /** 当前会话若是 Desktop 侧车，记下其文件（sidecar_ 前缀）；正常会话为 undefined。 */
+  let sidecarFile;
   const agentDir = env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent');
   const registryDir = options.registryDir || path.join(agentDir, 'handoff');
   let peer;
@@ -64,6 +66,7 @@ export default function sessionHandoff(pi, options = {}) {
 
   const metadata = ctx => {
     const file = ctx.sessionManager.getSessionFile();
+    sidecarFile = file && path.basename(file).startsWith('sidecar_') ? file : undefined;
     if (!file) return undefined;
     // pi may not have flushed the transcript yet, so the file can be absent while an
     // idle session is still a perfectly valid handoff target. Key off the path pi
@@ -108,12 +111,27 @@ export default function sessionHandoff(pi, options = {}) {
     }
     return inject(item);
   }
+  /**
+   * 侧车会话识别（单写者：侧车不得作为交接的发送方，也不得被注册为候选）。
+   * Desktop 副驾的会话文件以 sidecar_ 前缀创建（backend.ts connect()），且
+   * header 只写 type/version/id/timestamp/cwd——**不带 parentSession**。
+   *
+   * 历史 bug：此前用 header.parentSession 判侧车，而 parentSession 是 pi 自己的
+   * 分支/fork 语义（session-manager createBranchedSession / fork 都会写它），
+   * 于是所有编辑重发、compact 分支、fork 出来的正常会话都被误判成侧车：
+   * 不建 peer、不作为候选，模型调用 session_handoff 只能看到误导性的
+   * 「当前会话尚未持久化」然后无限重试（2026-10-31 用户实测，VE 项目分支会话）。
+   *
+   * 现在用文件名前缀（Desktop 侧车唯一可靠标识），分支/重发会话恢复可用。
+   */
+  const isSidecar = ctx => (ctx ? path.basename(ctx.sessionManager?.getSessionFile?.() ?? '').startsWith('sidecar_') : !!sidecarFile);
+
   async function start(ctx) {
     context = ctx;
-    if (!alive || peer || !['tui', 'rpc'].includes(ctx.mode) || ctx.sessionManager.getHeader?.()?.parentSession || env.PI_DESKTOP_SIDECAR === '1') return;
+    if (!alive || peer || !['tui', 'rpc'].includes(ctx.mode)) return;
     if (startPromise) return startPromise;
-    const meta = metadata(ctx);
-    if (!meta) return;
+    const meta = metadata(ctx); // 先求值：内部会解析出 sidecarFile
+    if (!meta || isSidecar()) return;
     startPromise = wire.startPeer({registryDir, metadata: meta, receive});
     try {
       const next = await startPromise;
@@ -123,13 +141,18 @@ export default function sessionHandoff(pi, options = {}) {
   }
   pi.on('session_start', async (_event, ctx) => {
     alive = true;
-    // Extension tools are not activated by defaultTools/--tools, so a portable install
-    // would register session_handoff but never declare it to the model. Activate it here,
-    // the same way desktop-policy activates desktop_update_plan.
-    try {
-      const active = pi.getActiveTools?.() ?? [];
-      if (!active.includes('session_handoff')) pi.setActiveTools?.([...active, 'session_handoff']);
-    } catch { /* activation is best-effort; the tool still works when called explicitly */ }
+    // 侧车（sidecar_ 前缀）不参与交接：不激活工具，也不建 peer。
+    // 判据必须只看文件名前缀——header.parentSession 是 pi 的分支/fork 语义，
+    // 用它会把编辑重发、compact 分支、fork 出来的正常用户会话全误判成侧车。
+    if (!isSidecar(ctx)) {
+      // Extension tools are not activated by defaultTools/--tools, so a portable install
+      // would register session_handoff but never declare it to the model. Activate it here,
+      // the same way desktop-policy activates desktop_update_plan.
+      try {
+        const active = pi.getActiveTools?.() ?? [];
+        if (!active.includes('session_handoff')) pi.setActiveTools?.([...active, 'session_handoff']);
+      } catch { /* activation is best-effort; the tool still works when called explicitly */ }
+    }
     await start(ctx);
   });
   pi.on('before_agent_start', async (event, ctx) => {markReceipt(event); await start(ctx);});
@@ -215,7 +238,7 @@ export default function sessionHandoff(pi, options = {}) {
           else if (candidates.length > 1) throw new Error('多个在线候选，请先 list 并指定 sessionKey');
           const idempotencyKey = args.idempotencyKey || randomUUID();
           if (target) {
-            if (!peer) throw new Error('当前会话尚未持久化，请先发送一条消息后再交接');
+            if (!peer) throw new Error('当前会话尚未建立交接通道（会话刚创建、会话目录不可写，或当前是侧车会话）；请先发送一条消息后再试；侧车会话不能发起交接');
             result = await peer.send({sessionKey: target.sessionKey ?? target.key, message: args.message, source: metadata(ctx), idempotencyKey, signal});
           } else if (env.PI_DESKTOP_HANDOFF_BRIDGE === '1' && projectPath) {
             // send 是写操作，必须等应答方（排队语义由 Desktop 侧保证），但也不能无限挂——

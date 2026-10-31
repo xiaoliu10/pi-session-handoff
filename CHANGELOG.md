@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+## [0.1.3] - 2026-10-31
+
+### English
+
+#### Fixed
+
+- **Branched/forked/edited sessions can hand off again** (regression fix): sidecar detection wrongly used the session header's `parentSession` field. But `parentSession` is pi's own branch/fork marker (written by `createBranchedSession` for edit-resend, compaction branches and forks), while Desktop sidecar sessions are created with a `sidecar_` filename prefix and **no** `parentSession` at all. Every branch session therefore lost its peer and any `session_handoff` call failed with a misleading "当前会话尚未持久化" and retried forever (live report 2026-10-31 from a long-lived branched session in the pi-virtual-employee project). Detection now uses the `sidecar_` filename prefix, which is the only marker Desktop actually sets; the generic no-peer error also now says what is really wrong.
+
+### 中文
+
+#### 修复
+
+- **分支/编辑重发/fork 会话恢复可交接**（回退上一版误伤修复）：侧车识别此前用 header 的 `parentSession` 字段，但那是 **pi 自己的分支/fork 标记**（`createBranchedSession` 为编辑重发、compact 分支、fork 写入），而 Desktop 侧车会话以 `sidecar_` 文件名前缀创建、**根本不写** `parentSession`。结果所有分支会话都被误判成侧车：不建 peer，调用 `session_handoff` 只能看到误导性的「当前会话尚未持久化」然后无限重试（2026-10-31 用户实测，pi-virtual-employee 项目一个长期在用的分支会话）。现在改用 `sidecar_` 文件名前缀（Desktop 唯一真实设置的标记），分支/重发会话恢复可用；通用 no-peer 报错也改成了说真话。
+
 
 ## [0.1.0] - 2026-10-29
 
