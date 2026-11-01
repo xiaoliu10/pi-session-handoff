@@ -49,10 +49,27 @@ function envelope(message, source = {}, receipt) {
   ].join('\n');
 }
 
+/** 统一取 custom entry 的类型（历史回放里可能是 {type:'custom',customType} 或扁平对象）。 */
+const customTypeOf = e => {
+  if (!e || typeof e !== 'object') return '';
+  if (typeof e.customType === 'string') return e.customType;
+  return e.type === 'custom' && typeof e.customType === 'string' ? e.customType : '';
+};
+
+/** 排队项落盘格式（session-handoff-queued.data）。 */
+const queuedRecord = item => ({
+  message: item.message,
+  source: item.source,
+  idempotencyKey: item.idempotencyKey,
+  at: Date.now(),
+});
+
 /** A normal pi package: resources are owned by session_start/shutdown, not the factory. */
 export default function sessionHandoff(pi, options = {}) {
   const wire = options.transport ?? transport;
   const env = options.env ?? process.env;
+  /** 会话历史读取（恢复排队项用）；默认走 pi.getEntries()。 */
+  const readEntries = options.readEntries;
   /** 当前会话若是 Desktop 侧车，记下其文件（sidecar_ 前缀）；正常会话为 undefined。 */
   let sidecarFile;
   const agentDir = env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent');
@@ -63,6 +80,23 @@ export default function sessionHandoff(pi, options = {}) {
   let startPromise;
   const queue = [];
   const receipts = new Map();
+  /**
+   * 已受理的幂等键（含已投递、已排队）。此前完全没有去重表：
+   * 同一 idempotencyKey 会被反复投递，产生重复任务。
+   */
+  const seenKeys = new Set();
+
+  /**
+   * 排队项立即落盘。此前排队只存在内存，会话关闭时 queue.splice(0) 全丢，
+   * 用户在任何 UI 上都看不到「有一条交接在等」（2026-11-01 VE 实测第二条
+   * 交接就是这样静默消失的）。落盘后 session_start 可以恢复重投。
+   */
+  const persistQueued = item => {
+    try { pi.appendEntry?.('session-handoff-queued', queuedRecord(item)); } catch { /* 审计尽力而为 */ }
+  };
+  const markDone = key => {
+    try { pi.appendEntry?.('session-handoff-done', { idempotencyKey: key, at: Date.now() }); } catch { /* ignore */ }
+  };
 
   const metadata = ctx => {
     const file = ctx.sessionManager.getSessionFile();
@@ -102,12 +136,22 @@ export default function sessionHandoff(pi, options = {}) {
   }
   async function receive(item) {
     if (!alive || !context) throw new Error('接收会话已关闭或失效');
+    const key = item.idempotencyKey;
+    if (key && seenKeys.has(key)) return {disposition: 'duplicate'};
+    if (key) seenKeys.add(key);
     if (!context.isIdle() || queue.length) {
-      if (queue.length >= MAX_QUEUED) throw new Error('交接队列已满');
+      if (queue.length >= MAX_QUEUED) {
+        if (key) seenKeys.delete(key);
+        throw new Error('交接队列已满');
+      }
       // Retain before sending to pi: compaction rejects even followUp in pi 1.4.0.
       // The bounded queue is drained only at final idle, never at agent_end.
+      // 落盘先于 push：崩溃/关闭后还能从会话文件恢复。
+      persistQueued(item);
       queue.push(item);
-      return {disposition: 'queued'};
+      // queued 不等于送达：必须让用户看见「有一条交接在等」。
+      context.ui?.notify?.(`收到一条会话交接，目标会话运行中已排队（待空闲后自动投递）。`, 'info');
+      return {disposition: 'queued', queued: queue.length};
     }
     return inject(item);
   }
@@ -154,25 +198,70 @@ export default function sessionHandoff(pi, options = {}) {
       } catch { /* activation is best-effort; the tool still works when called explicitly */ }
     }
     await start(ctx);
+    // 恢复上次未完成的排队项：会话关闭/重启会丢掉内存队列（2026-11-01 VE 实测
+    // 两条交接静默消失）。已投递的键记在 session-handoff-done 里，不再重投。
+    if (!isSidecar(ctx)) restoreQueued();
   });
   pi.on('before_agent_start', async (event, ctx) => {markReceipt(event); await start(ctx);});
-  pi.on('agent_settled', async (_event, ctx) => {
-    context = ctx;
-    if (peer) await peer.update(metadata(ctx));
+  /**
+   * 排空队列：只在真正空闲时投递一条。会话启动时恢复的排队项也走这里，
+   * 否则要等用户下一条消息才能触发（用户视角就是「交接再也没出现」）。
+   */
+  function drainQueue() {
     if (!alive || !queue.length) return;
-    // An idle notification is being dispatched; pi defers prompts until it exits.
     setImmediate(async () => {
-      if (!alive || !context.isIdle()) return;
+      if (!alive || !context?.isIdle?.()) return;
       const item = queue.shift();
       if (!item) return;
-      try { await inject(item); }
+      try { await inject(item); if (item.idempotencyKey) markDone(item.idempotencyKey); }
       catch (error) {
         context?.ui.notify(`交接未获启动确认：${error.message}。原任务：${item.message}`, 'error');
         // Keep an audit in the recipient session; never silently claim completion.
-        pi.appendEntry?.('session-handoff-undelivered', {message: item.message, source: item.source, error: error.message});
+        pi.appendEntry?.('session-handoff-undelivered', {message: item.message, source: item.source, idempotencyKey: item.idempotencyKey, error: error.message});
       }
     });
+  }
+  pi.on('agent_settled', async (_event, ctx) => {
+    context = ctx;
+    if (peer) await peer.update(metadata(ctx));
+    // An idle notification is being dispatched; pi defers prompts until it exits.
+    drainQueue();
   });
+  /**
+   * 从会话历史恢复排队项。读不到历史（TUI/测试未注入 readEntries）时退回
+   * pi.getEntries?.()，再退回空——恢复是尽力而为，绝不阻塞会话启动。
+   */
+  function restoreQueued() {
+    let entries = [];
+    try { entries = readEntries?.() ?? pi.getEntries?.() ?? []; } catch { entries = []; }
+    if (!Array.isArray(entries) || !entries.length) return;
+    const done = new Set();
+    for (const e of entries) {
+      const ct = customTypeOf(e);
+      if (ct === 'session-handoff-done' && e.data?.idempotencyKey) done.add(e.data.idempotencyKey);
+      if (ct === 'session-handoff-undelivered') {
+        for (const m of e.data?.messages ?? []) if (m.idempotencyKey) done.add(m.idempotencyKey);
+        if (e.data?.message && e.data?.source) { /* 单条历史格式，保留待恢复 */ }
+      }
+    }
+    let restored = 0;
+    for (const e of entries) {
+      const ct = e?.customType ?? '';
+      if (ct !== 'session-handoff-queued') continue;
+      const d = e.data ?? {};
+      if (!d.message) continue;
+      if (d.idempotencyKey && (done.has(d.idempotencyKey) || seenKeys.has(d.idempotencyKey))) continue;
+      if (queue.length >= MAX_QUEUED) break;
+      if (d.idempotencyKey) seenKeys.add(d.idempotencyKey);
+      queue.push({ message: d.message, source: d.source ?? {}, idempotencyKey: d.idempotencyKey });
+      restored += 1;
+    }
+    if (restored) {
+      context?.ui?.notify?.(`恢复了 ${restored} 条未投递的会话交接，将在空闲后投递。`, 'info');
+      drainQueue();
+    }
+  }
+
   pi.on('session_shutdown', async () => {
     alive = false;
     for (const receipt of receipts.values()) {
@@ -180,8 +269,11 @@ export default function sessionHandoff(pi, options = {}) {
     }
     receipts.clear();
     if (queue.length) {
-      pi.appendEntry?.('session-handoff-undelivered', {messages: queue.splice(0), error: '接收会话关闭；排队尚未执行'});
-      context?.ui.notify('会话关闭，尚未执行的交接已记录为未投递。', 'warning');
+      // 排队项已在排队时落盘（session-handoff-queued），这里只留一条可读审计；
+      // 下次 session_start 会真正恢复重投，不再「记录为未投递」就算完。
+      const dropped = queue.splice(0);
+      pi.appendEntry?.('session-handoff-undelivered', {messages: dropped, error: '接收会话关闭；排队尚未执行，重启后自动恢复'});
+      context?.ui.notify(`会话关闭，${dropped.length} 条排队交接将在下次打开时自动恢复投递。`, 'warning');
     }
     await startPromise?.catch(() => {});
     const current = peer; peer = undefined;
